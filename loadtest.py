@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
 Measures dashboard page-load latency for Bank of FinTechCo.
-Usage: python loadtest.py [--url http://localhost:8080] [--requests 50]
+
+Usage:
+  python loadtest.py [--url URL] [--requests N] [--baseline-ms MS]
+
+If p50 latency exceeds --baseline-ms, exits with code 1 and prints a
+structured INCIDENT block so callers can act on it (e.g. Slack alert).
 """
 
 import argparse
+import json
 import statistics
+import sys
 import time
 
 import requests
 
-DEFAULT_URL = "http://localhost:8080"
-DEFAULT_N   = 50
-USERNAME    = "testuser"
-PASSWORD    = "bankofanthos"
+DEFAULT_URL         = "http://localhost:8080"
+DEFAULT_N           = 50
+DEFAULT_BASELINE_MS = 50        # golden baseline — alert if p50 exceeds this
+USERNAME            = "testuser"
+PASSWORD            = "bankofanthos"
 
 
 def login(base_url: str) -> requests.Session:
@@ -39,45 +47,77 @@ def run(base_url: str, n: int) -> list[float]:
     return latencies
 
 
-def report(latencies: list[float], n: int) -> None:
+def compute_stats(latencies: list[float], n: int) -> dict:
     total_s = sum(latencies) / 1000
-    rps = n / total_s
+    return {
+        "requests" : n,
+        "total_s"  : round(total_s, 2),
+        "rps"      : round(n / total_s, 2),
+        "min_ms"   : round(min(latencies), 1),
+        "mean_ms"  : round(statistics.mean(latencies), 1),
+        "p50_ms"   : round(statistics.median(latencies), 1),
+        "p95_ms"   : round(statistics.quantiles(latencies, n=100)[94], 1),
+        "p99_ms"   : round(statistics.quantiles(latencies, n=100)[98], 1),
+        "max_ms"   : round(max(latencies), 1),
+    }
 
-    mn   = min(latencies)
-    mean = statistics.mean(latencies)
-    p50  = statistics.median(latencies)
-    p95  = statistics.quantiles(latencies, n=100)[94]
-    p99  = statistics.quantiles(latencies, n=100)[98]
-    mx   = max(latencies)
+
+def report(stats: dict, baseline_ms: float) -> bool:
+    """Print summary table. Returns True if an incident was detected."""
+    s = stats
+    incident = s["p50_ms"] > baseline_ms
 
     col = 14
     print()
     print("=" * 40)
-    print(f"  {'Requests':<{col}} {n}")
-    print(f"  {'Total time':<{col}} {total_s:.2f} s")
-    print(f"  {'Req/sec':<{col}} {rps:.2f}")
+    print(f"  {'Requests':<{col}} {s['requests']}")
+    print(f"  {'Total time':<{col}} {s['total_s']} s")
+    print(f"  {'Req/sec':<{col}} {s['rps']}")
     print("-" * 40)
-    print(f"  {'Min':<{col}} {mn:.1f} ms")
-    print(f"  {'Mean':<{col}} {mean:.1f} ms")
-    print(f"  {'p50':<{col}} {p50:.1f} ms")
-    print(f"  {'p95':<{col}} {p95:.1f} ms")
-    print(f"  {'p99':<{col}} {p99:.1f} ms")
-    print(f"  {'Max':<{col}} {mx:.1f} ms")
+    print(f"  {'Min':<{col}} {s['min_ms']} ms")
+    print(f"  {'Mean':<{col}} {s['mean_ms']} ms")
+    print(f"  {'p50':<{col}} {s['p50_ms']} ms  {'<-- SLOW' if incident else ''}")
+    print(f"  {'p95':<{col}} {s['p95_ms']} ms")
+    print(f"  {'p99':<{col}} {s['p99_ms']} ms")
+    print(f"  {'Max':<{col}} {s['max_ms']} ms")
+    print(f"  {'Baseline':<{col}} {baseline_ms} ms")
     print("=" * 40)
+
+    if incident:
+        ratio = round(s["p50_ms"] / baseline_ms, 1)
+        print()
+        print("INCIDENT_DETECTED")
+        print(json.dumps({
+            "route"       : "/home",
+            "p50_ms"      : s["p50_ms"],
+            "baseline_ms" : baseline_ms,
+            "ratio"       : ratio,
+            "rps"         : s["rps"],
+            "p95_ms"      : s["p95_ms"],
+            "p99_ms"      : s["p99_ms"],
+        }))
+
+    return incident
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--requests", dest="n", type=int, default=DEFAULT_N)
+    parser.add_argument("--baseline-ms", type=float, default=DEFAULT_BASELINE_MS,
+                        help="Golden baseline p50 (ms). Alert if exceeded.")
     args = parser.parse_args()
 
-    print(f"Target : {args.url}/home")
-    print(f"Sending: {args.n} sequential requests as {USERNAME!r}")
+    print(f"Target   : {args.url}/home")
+    print(f"Sending  : {args.n} sequential requests as {USERNAME!r}")
+    print(f"Baseline : {args.baseline_ms} ms p50")
     print()
 
     latencies = run(args.url, args.n)
-    report(latencies, args.n)
+    stats     = compute_stats(latencies, args.n)
+    incident  = report(stats, args.baseline_ms)
+
+    sys.exit(1 if incident else 0)
 
 
 if __name__ == "__main__":
