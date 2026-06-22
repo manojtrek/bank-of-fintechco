@@ -9,8 +9,8 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Load secrets from .env if present
-[ -f "$REPO_DIR/.env" ] && set -a && source "$REPO_DIR/.env" && set +a
+# Load secrets from ~/.env (survives repo deletion)
+[ -f "$HOME/.env" ] && set -a && source "$HOME/.env" && set +a
 
 FEAT_BRANCH="feat/audit-signing"
 STAGE_BRANCH="stage"
