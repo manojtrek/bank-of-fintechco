@@ -3,22 +3,29 @@
 #   1. Create/reset the stage branch and merge feat/audit-signing into it
 #   2. Restart the Flask app on the staged code
 #   3. Run the load test against the golden baseline
-#   4. If regression detected, fire a Slack incident via Claude CLI
+#   4. If regression detected, post a Slack incident via curl
 
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load secrets from .env if present
+[ -f "$REPO_DIR/.env" ] && set -a && source "$REPO_DIR/.env" && set +a
+
 FEAT_BRANCH="feat/audit-signing"
 STAGE_BRANCH="stage"
 BASELINE_MS=50
 REQUESTS=10
 APP_URL="http://localhost:8080"
-SLACK_CHANNEL_ID="C0BC495E9D2"   # #all-things-sre
+SLACK_CHANNEL_ID="C0BC495E9D2"          # #all-things-sre
+SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"  # export SLACK_BOT_TOKEN=xoxb-... before running
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[SRE]${NC} $*"; }
 warn() { echo -e "${YELLOW}[SRE]${NC} $*"; }
 die()  { echo -e "${RED}[SRE] ERROR:${NC} $*"; exit 1; }
+
+[ -n "$SLACK_BOT_TOKEN" ] || die "SLACK_BOT_TOKEN is not set. Run: export SLACK_BOT_TOKEN=xoxb-..."
 
 cd "$REPO_DIR"
 
@@ -26,7 +33,6 @@ cd "$REPO_DIR"
 echo ""
 echo -e "${BOLD}━━━ Step 1 — Merge $FEAT_BRANCH → $STAGE_BRANCH (main untouched) ━━━${NC}"
 
-# Create or reset stage off current main
 if git show-ref --verify --quiet "refs/heads/$STAGE_BRANCH"; then
     log "Resetting existing $STAGE_BRANCH to main..."
     git checkout "$STAGE_BRANCH" --quiet
@@ -86,7 +92,7 @@ LOADTEST_EXIT=$?
 set -e
 echo "$LOADTEST_OUTPUT"
 
-# ── 4. Incident? Fire Slack via Claude CLI ────────────────────────────────────
+# ── 4. Incident? Post to Slack via curl ───────────────────────────────────────
 if [ "$LOADTEST_EXIT" -ne 1 ]; then
     echo ""
     log "All clear — p50 within baseline. Safe to promote $STAGE_BRANCH → main."
@@ -94,7 +100,7 @@ if [ "$LOADTEST_EXIT" -ne 1 ]; then
 fi
 
 echo ""
-echo -e "${BOLD}━━━ Step 4 — Regression detected — firing Slack alert via Claude ━━━${NC}"
+echo -e "${BOLD}━━━ Step 4 — Regression detected — posting Slack incident ━━━${NC}"
 
 INCIDENT_JSON=$(echo "$LOADTEST_OUTPUT" | grep -A1 "^INCIDENT_DETECTED" | grep "^{")
 [ -n "$INCIDENT_JSON" ] || die "Could not parse INCIDENT_DETECTED JSON."
@@ -106,24 +112,68 @@ print(d["p50_ms"], d["baseline_ms"], d["ratio"], d["p95_ms"], d["p99_ms"], d["rp
 PYEOF
 )
 
-echo -e "${RED}  p50 = ${P50}ms  (${RATIO}x over ${BASELINE}ms baseline)${NC}"
+# Generate a time-based incident ID: INC-YYYYMMDD-HHMM
+INCIDENT_ID="INC-$(date +%Y%m%d-%H%M)"
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+COMMIT_SHA="$(git rev-parse --short HEAD)"
+AUTHOR="$(git log -1 --pretty=format:'%an' HEAD)"
+
+echo -e "${RED}  Incident ID : $INCIDENT_ID${NC}"
+echo -e "${RED}  p50         : ${P50}ms  (${RATIO}x over ${BASELINE}ms baseline)${NC}"
 echo ""
-log "Invoking Claude CLI to post incident to Slack (#all-things-sre)..."
+log "Posting to Slack #all-things-sre..."
+
+SLACK_PAYLOAD=$(python3 - <<PYEOF
+import json
+payload = {
+    "channel": "${SLACK_CHANNEL_ID}",
+    "text": ":rotating_light: Performance Incident ${INCIDENT_ID}",
+    "blocks": [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": ":rotating_light:  ${INCIDENT_ID} — Dashboard Performance Regression"}
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": "*Status*\n:red_circle: Open"},
+                {"type": "mrkdwn", "text": "*Environment*\nStaging (main is clean)"},
+                {"type": "mrkdwn", "text": "*Route*\n\`GET /home\`"},
+                {"type": "mrkdwn", "text": "*Triggered by*\nMerge of \`${FEAT_BRANCH}\`\nAuthor: ${AUTHOR} · \`${COMMIT_SHA}\`"}
+            ]
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Latency vs Golden Baseline*\n\`\`\`p50   ${P50} ms   (${RATIO}x over ${BASELINE} ms baseline)  ← SLOW\np95   ${P95} ms\np99   ${P99} ms\nrps   ${RPS} req/sec\`\`\`"
+            }
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "Detected at ${TIMESTAMP} · repo: $(pwd)"}]
+        }
+    ]
+}
+print(json.dumps(payload))
+PYEOF
+)
+
+SLACK_RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
+    -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$SLACK_PAYLOAD")
+
+SLACK_OK=$(echo "$SLACK_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok','false'))")
+
+if [ "$SLACK_OK" = "True" ] || [ "$SLACK_OK" = "true" ]; then
+    log "Incident ${INCIDENT_ID} posted to #all-things-sre."
+else
+    SLACK_ERR=$(echo "$SLACK_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))")
+    warn "Slack post failed: $SLACK_ERR"
+    warn "Raw response: $SLACK_RESPONSE"
+fi
+
 echo ""
-
-claude --print \
-"Use the Slack MCP tool to post a performance incident alert to Slack channel ID ${SLACK_CHANNEL_ID} (#all-things-sre).
-
-Incident details:
-- Route: GET /home (account dashboard)
-- Environment: staging (branch: ${STAGE_BRANCH})
-- p50 latency: ${P50}ms — ${RATIO}x over the ${BASELINE}ms golden baseline
-- p95: ${P95}ms | p99: ${P99}ms | throughput: ${RPS} req/sec
-- Introduced by: merge of ${FEAT_BRANCH} into ${STAGE_BRANCH}
-- main is NOT affected — regression caught in staging
-
-Format it as a clear, urgent incident notification with these numbers."
-
-echo ""
-echo -e "${RED}[SRE] Incident posted to Slack. main is clean — $STAGE_BRANCH is blocked from promotion.${NC}"
+echo -e "${RED}[SRE] ${INCIDENT_ID} open. main is clean — $STAGE_BRANCH blocked from promotion.${NC}"
 exit 1

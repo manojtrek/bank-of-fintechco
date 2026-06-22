@@ -29,6 +29,9 @@ env/
 # No persistent DB (everything is in-memory)
 instance/
 
+# Secrets
+.env
+
 # IDE / OS
 .idea/
 .vscode/
