@@ -36,8 +36,6 @@ git restore . 2>/dev/null || true
 echo ""
 echo -e "${BOLD}━━━ Step 1 — Merge $FEAT_BRANCH → $STAGE_BRANCH (main untouched) ━━━${NC}"
 
-git fetch origin --quiet
-
 if git show-ref --verify --quiet "refs/heads/$STAGE_BRANCH"; then
     log "Resetting existing $STAGE_BRANCH to main..."
     git checkout "$STAGE_BRANCH" --quiet
@@ -47,7 +45,7 @@ else
     git checkout -b "$STAGE_BRANCH" main --quiet
 fi
 
-MERGE_OUT=$(git merge --no-ff "origin/$FEAT_BRANCH" \
+MERGE_OUT=$(git merge --no-ff "$FEAT_BRANCH" \
     -m "Merge $FEAT_BRANCH into $STAGE_BRANCH [staging deploy]" 2>&1) && {
     log "Merged $FEAT_BRANCH into $STAGE_BRANCH."
     echo "$MERGE_OUT"
