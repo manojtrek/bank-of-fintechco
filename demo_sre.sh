@@ -29,6 +29,9 @@ die()  { echo -e "${RED}[SRE] ERROR:${NC} $*"; exit 1; }
 
 cd "$REPO_DIR"
 
+# Discard any local working tree changes before starting
+git restore . 2>/dev/null || true
+
 # ── 1. Merge feat → stage (main stays untouched) ──────────────────────────────
 echo ""
 echo -e "${BOLD}━━━ Step 1 — Merge $FEAT_BRANCH → $STAGE_BRANCH (main untouched) ━━━${NC}"
