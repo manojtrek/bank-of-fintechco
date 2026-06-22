@@ -18,4 +18,3 @@ echo -e "${GREEN}Branch      :${NC} $(git branch --show-current)"
 echo -e "${GREEN}Last commit :${NC} $(git log -1 --format='%h %s (%an)')"
 echo ""
 
-claude
