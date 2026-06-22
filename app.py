@@ -6,6 +6,8 @@ Single Flask app. Everything is in-memory with preloaded sample records.
 No database, no files, resets on restart.
 """
 
+import hashlib
+import hmac
 import os
 import re
 import random
@@ -25,6 +27,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 LOCAL_ROUTING = "883745000"
 SECRET_KEY = os.getenv("SECRET_KEY", "fintechco-monolith-dev-secret-change-me")
 BANK_NAME = os.getenv("BANK_NAME", "Bank of FinTechCo")
+AUDIT_SIGNING_KEY = os.getenv("AUDIT_SIGNING_KEY", "fintechco-audit-signing-key-default")
 DEFAULT_PASSWORD = "bankofanthos"
 
 app = Flask(__name__)
@@ -294,6 +297,17 @@ def authenticate(username, password):
         "name": f"{user['firstname']} {user['lastname']}".strip(),
     }
 
+def sign_audit_record(record):
+    # Tamper-evident audit logging: PBKDF2-HMAC signs each dashboard snapshot
+    # so records can't be silently altered after the fact (compliance requirement).
+    payload = json.dumps(record, sort_keys=True).encode()
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        payload,
+        AUDIT_SIGNING_KEY.encode(),
+        2_500_000,
+    ).hex()
+
 def record_transaction(from_acct, to_acct, from_route, to_route, amount):
     """amount in cents (positive int). Append to in-memory ledger."""
     if amount <= 0:
@@ -333,6 +347,9 @@ def home():
             t["accountLabel"] = contact_map.get(t["fromAccountNum"])
         else:
             t["accountLabel"] = contact_map.get(t["toAccountNum"])
+
+    # Sign audit snapshot before serving the dashboard.
+    sign_audit_record({"account_id": user["account_id"], "balance": balance, "ts": _now_ts()})
 
     msg = request.args.get("msg")
 
