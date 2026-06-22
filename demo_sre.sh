@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # demo_sre.sh — SRE persona trigger:
-#   1. Merge feat/audit-signing → main
-#   2. Restart the Flask app on the merged code
+#   1. Create/reset the stage branch and merge feat/audit-signing into it
+#   2. Restart the Flask app on the staged code
 #   3. Run the load test against the golden baseline
 #   4. If regression detected, fire a Slack incident via Claude CLI
 
@@ -9,6 +9,7 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 FEAT_BRANCH="feat/audit-signing"
+STAGE_BRANCH="stage"
 BASELINE_MS=50
 REQUESTS=10
 APP_URL="http://localhost:8080"
@@ -21,27 +22,36 @@ die()  { echo -e "${RED}[SRE] ERROR:${NC} $*"; exit 1; }
 
 cd "$REPO_DIR"
 
-# ── 1. Merge ───────────────────────────────────────────────────────────────────
+# ── 1. Merge feat → stage (main stays untouched) ──────────────────────────────
 echo ""
-echo -e "${BOLD}━━━ Step 1 — Merge $FEAT_BRANCH → main ━━━${NC}"
-git checkout main --quiet
+echo -e "${BOLD}━━━ Step 1 — Merge $FEAT_BRANCH → $STAGE_BRANCH (main untouched) ━━━${NC}"
+
+# Create or reset stage off current main
+if git show-ref --verify --quiet "refs/heads/$STAGE_BRANCH"; then
+    log "Resetting existing $STAGE_BRANCH to main..."
+    git checkout "$STAGE_BRANCH" --quiet
+    git reset --hard main --quiet
+else
+    log "Creating $STAGE_BRANCH from main..."
+    git checkout -b "$STAGE_BRANCH" main --quiet
+fi
 
 MERGE_OUT=$(git merge --no-ff "$FEAT_BRANCH" \
-    -m "Merge $FEAT_BRANCH into main" 2>&1) && {
-    log "Merged successfully."
+    -m "Merge $FEAT_BRANCH into $STAGE_BRANCH [staging deploy]" 2>&1) && {
+    log "Merged $FEAT_BRANCH into $STAGE_BRANCH."
     echo "$MERGE_OUT"
 } || {
     if echo "$MERGE_OUT" | grep -q "Already up to date"; then
-        warn "Branch already merged — continuing."
+        warn "Already up to date — continuing."
     else
         echo "$MERGE_OUT"
         die "Merge failed. Resolve conflicts and re-run."
     fi
 }
 
-# ── 2. Restart app ─────────────────────────────────────────────────────────────
+# ── 2. Restart app on staged code ─────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}━━━ Step 2 — Restart Flask app ━━━${NC}"
+echo -e "${BOLD}━━━ Step 2 — Restart Flask app on $STAGE_BRANCH ━━━${NC}"
 
 EXISTING_PID=$(lsof -ti :8080 2>/dev/null || true)
 if [ -n "$EXISTING_PID" ]; then
@@ -50,7 +60,7 @@ if [ -n "$EXISTING_PID" ]; then
     sleep 1
 fi
 
-log "Starting app on merged code..."
+log "Starting app..."
 python app.py > /tmp/bank-app.log 2>&1 &
 APP_PID=$!
 
@@ -62,7 +72,7 @@ for _ in $(seq 1 20); do
     fi
     sleep 0.5
 done
-[ "$READY" -eq 1 ] || die "App did not start in time. Check /tmp/bank-app.log"
+[ "$READY" -eq 1 ] || die "App did not start. Check /tmp/bank-app.log"
 log "App is ready (PID $APP_PID)."
 
 # ── 3. Load test ───────────────────────────────────────────────────────────────
@@ -76,10 +86,10 @@ LOADTEST_EXIT=$?
 set -e
 echo "$LOADTEST_OUTPUT"
 
-# ── 4. Incident alert ──────────────────────────────────────────────────────────
+# ── 4. Incident? Fire Slack via Claude CLI ────────────────────────────────────
 if [ "$LOADTEST_EXIT" -ne 1 ]; then
     echo ""
-    log "All clear — p50 within baseline. No incident."
+    log "All clear — p50 within baseline. Safe to promote $STAGE_BRANCH → main."
     exit 0
 fi
 
@@ -87,7 +97,7 @@ echo ""
 echo -e "${BOLD}━━━ Step 4 — Regression detected — firing Slack alert via Claude ━━━${NC}"
 
 INCIDENT_JSON=$(echo "$LOADTEST_OUTPUT" | grep -A1 "^INCIDENT_DETECTED" | grep "^{")
-[ -n "$INCIDENT_JSON" ] || die "Could not parse INCIDENT_DETECTED JSON from loadtest output."
+[ -n "$INCIDENT_JSON" ] || die "Could not parse INCIDENT_DETECTED JSON."
 
 read P50 BASELINE RATIO P95 P99 RPS <<< $(echo "$INCIDENT_JSON" | python3 - <<'PYEOF'
 import sys, json
@@ -98,7 +108,7 @@ PYEOF
 
 echo -e "${RED}  p50 = ${P50}ms  (${RATIO}x over ${BASELINE}ms baseline)${NC}"
 echo ""
-log "Invoking Claude CLI to post incident to Slack channel $SLACK_CHANNEL_ID..."
+log "Invoking Claude CLI to post incident to Slack (#all-things-sre)..."
 echo ""
 
 claude --print \
@@ -106,13 +116,14 @@ claude --print \
 
 Incident details:
 - Route: GET /home (account dashboard)
-- p50 latency: ${P50}ms — that is ${RATIO}x over the ${BASELINE}ms golden baseline
+- Environment: staging (branch: ${STAGE_BRANCH})
+- p50 latency: ${P50}ms — ${RATIO}x over the ${BASELINE}ms golden baseline
 - p95: ${P95}ms | p99: ${P99}ms | throughput: ${RPS} req/sec
-- Trigger: merge of branch ${FEAT_BRANCH} into main
-- Repo: $(pwd)
+- Introduced by: merge of ${FEAT_BRANCH} into ${STAGE_BRANCH}
+- main is NOT affected — regression caught in staging
 
 Format it as a clear, urgent incident notification with these numbers."
 
 echo ""
-echo -e "${RED}[SRE] Incident fired to Slack. Hand off to SRE on-call for investigation.${NC}"
+echo -e "${RED}[SRE] Incident posted to Slack. main is clean — $STAGE_BRANCH is blocked from promotion.${NC}"
 exit 1
